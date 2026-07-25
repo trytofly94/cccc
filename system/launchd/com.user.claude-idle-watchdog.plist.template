@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.user.claude-idle-watchdog.plist.template — launchd template for the
+  opt-in claude-idle-watchdog RAM-reclaim daemon (docs/IDLE_WATCHDOG.md).
+
+  This is a TEMPLATE, not a ready-to-load plist: every home-directory
+  placeholder below must be substituted with a real absolute path before
+  launchctl can use it (launchd plists cannot contain literal `$HOME` or
+  `~` — they need a real path). Never hardcode an absolute /Users/<name>
+  path in this repo-shipped template; substitution happens at
+  install/restore time (system/restore.sh locally, install.sh's opt-in
+  offer for other installs).
+
+  RunAtLoad + KeepAlive keep the daemon polling every 60s once loaded, but
+  its own settings-gate (IDLE_WATCHDOG=off|on, default off) makes every pass
+  a no-op unless a human has explicitly opted in — see docs/IDLE_WATCHDOG.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.claude-idle-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.local/bin/claude-idle-watchdog</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.local/bin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/log/claude-idle-watchdog.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/log/claude-idle-watchdog.launchd.log</string>
+</dict>
+</plist>

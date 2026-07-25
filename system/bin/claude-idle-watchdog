@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# claude-idle-watchdog — reclaims RAM from idle / abandoned Claude Code sessions.
+#
+# claude never releases its V8 heap while running (monotonic). A detached session
+# idle for hours costs full RAM for zero work. The only reclaim lever is to QUIT
+# claude — which is loss-free here because claude flushes every message to
+# ~/.claude/projects/<slug>/<session-id>.jsonl and resumes exactly via
+# `claude --resume <session-id>`. On SIGTERM claude even prints that resume line
+# into the pane itself. The tmux session, pane, cwd and scrollback all survive.
+#
+# Two independent reclaim policies:
+#   1. Baseline reaper  — any cc- session idle > IDLE_2D_SECS AND detached: quit.
+#                         (obviously abandoned; runs regardless of memory pressure)
+#   2. Pressure valve   — while kernel memory pressure is SUSTAINED >= WARN level,
+#                         quit idle+detached sessions (oldest-idle first) until the
+#                         pressure clears or MAX_QUITS_PER_RUN is hit.
+#
+# Reclaim action = `kill -TERM` of the session's claude process. Never kill-session,
+# never key-injection. Only cc-* sessions; infra sessions are excluded.
+#
+# ---- Sharp edges (read before enabling) ----
+#   - Opt-in, default OFF: this daemon does NOTHING unless `IDLE_WATCHDOG=on` is
+#     set in settings.conf (cccc config / cccc settings web UI). A fresh
+#     install/launchd-load never reclaims anything on its own. See
+#     idle_watchdog_enabled() below — checked on every single pass, not just
+#     at startup, so toggling the setting off takes effect within one
+#     POLL_INTERVAL even if the launchd job stays loaded.
+#   - macOS-only. Non-Darwin platforms hit a graceful, logged no-op below
+#     (this daemon's core signal, `memory_pressure`'s free%, doesn't exist
+#     elsewhere) — never a hard error, never a crash-loop under launchd's
+#     KeepAlive.
+#   - Reclaim = SIGTERM the claude PROCESS, never `tmux kill-session`. The
+#     tmux session/pane/cwd/scrollback all survive; getting back into the
+#     conversation requires `claude --resume <session-id>`, NOT `--continue`
+#     (which starts fresh in the same directory instead of resuming). If a
+#     caller/wrapper assumes `--continue` is equivalent here, in-flight
+#     context is silently lost even though nothing "crashed".
+#   - CIW_FREE_FLOOR (default 12, percent) and CIW_IDLE_2D (default 172800s /
+#     2 days) are documented, env-overridable knobs — not hardcoded — see the
+#     Config block below for the full list (CIW_POLL, CIW_IDLE_PRESSURE,
+#     CIW_MAX_QUITS, CIW_SETTLE).
+#
+# Flags:
+#   --dry-run   log what WOULD be reclaimed, send no signals
+#   --once      run a single evaluation pass and exit (for testing/cron)
+#
+# Log: ~/.local/log/claude-idle-watchdog.log      Live: tail -f that file.
+
+set -uo pipefail
+
+# launchd starts us in the C locale (no LANG). Under C, the session-filter yields
+# ZERO candidates (locale-sensitive text handling in the tmux-output pipeline) —
+# the daemon would silently reap nothing. Force a UTF-8 locale so behavior matches
+# an interactive shell. Belt-and-suspenders with the LANG in the launchd plist.
+export LANG="${LANG:-en_US.UTF-8}"
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+
+# ---- Config (env-overridable) ----
+POLL_INTERVAL="${CIW_POLL:-60}"            # seconds between passes
+IDLE_2D_SECS="${CIW_IDLE_2D:-172800}"      # 2 days — baseline reaper threshold
+IDLE_PRESSURE_SECS="${CIW_IDLE_PRESSURE:-1800}"  # 30 min — pressure-valve threshold
+# Pressure trigger: FREE-PERCENT FLOOR, not kern.memorystatus_vm_pressure_level.
+# On this Mac that sysctl sits pinned at 2 ("warning") even at 45% free, so it is
+# useless as a trigger — it would fire constantly. `memory_pressure`'s free% is the
+# real distress signal: healthy at rest (~45%), collapses toward 0 in the OOM path.
+FREE_FLOOR_PCT="${CIW_FREE_FLOOR:-12}"     # engage valve when free% < this, sustained
+MAX_QUITS_PER_RUN="${CIW_MAX_QUITS:-5}"    # cap reclaims per pressure event
+SETTLE_SECS="${CIW_SETTLE:-3}"             # pause after a kill before re-reading pressure
+# Only touch cc-* sessions; never these infra/companion sessions:
+EXCLUDE_RE='^(limit-watcher-|conductor-|gsd-|watcher-)'
+
+# CONFIG_DIR mirrors cccc/cccc's own CC_CONFIG_DIR convention so a sandboxed
+# test (or a future CC_CONFIG_DIR=... dev invocation) can point this daemon
+# at a settings.conf that isn't the real ~/.config/claude-control one.
+CONFIG_DIR="${CC_CONFIG_DIR:-$HOME/.config/claude-control}"
+
+# idle_watchdog_enabled — true only if settings.conf has IDLE_WATCHDOG=on.
+# Absent file, absent key, or any value other than exactly "on" -> disabled
+# (fail-safe default, matching cccc/cccc's own CC_SET_IDLE_WATCHDOG="off"
+# default). Deliberately simple (grep, not a full parser) — this is the same
+# opt-in gate as cccc's, re-checked independently here so the daemon is safe
+# even if it's loaded outside of cccc's own sync_idle_watchdog() control.
+idle_watchdog_enabled() {
+    local f="$CONFIG_DIR/settings.conf" line value
+    [[ -f "$f" ]] || return 1
+    line=$(grep -m1 '^IDLE_WATCHDOG=' "$f" 2>/dev/null) || return 1
+    value="${line#IDLE_WATCHDOG=}"
+    value="${value%$'\r'}"
+    [[ "$value" == "on" ]]
+}
+
+# Platform gate — this daemon's core signal (memory_pressure's free%) is
+# macOS-only. A graceful, logged no-op on any other platform, never a hard
+# error/crash-loop under launchd's KeepAlive. Checked before LOG_FILE setup
+# so a non-macOS run doesn't even create ~/.local/log/claude-idle-watchdog.log.
+if [[ "$(uname -s 2>/dev/null)" != "Darwin" ]]; then
+    echo "[CIW] non-macOS platform ($(uname -s 2>/dev/null)) — idle-watchdog is macOS-only, exiting gracefully" >&2
+    exit 0
+fi
+
+DRY_RUN=false
+ONCE=false
+for a in "$@"; do
+    case "$a" in
+        --dry-run) DRY_RUN=true ;;
+        --once)    ONCE=true ;;
+        *) echo "unknown flag: $a" >&2; exit 2 ;;
+    esac
+done
+
+LOG_DIR="$HOME/.local/log"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/claude-idle-watchdog.log"
+# Rotate on startup — keep last 2000 lines
+if [[ -f "$LOG_FILE" ]] && (( $(wc -l < "$LOG_FILE") > 2000 )); then
+    tail -2000 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+fi
+log() {
+    local tag=""
+    $DRY_RUN && tag=" [dry]"                            # boolean, not ${x:+} — "false" is non-empty
+    local msg="[CIW $(date '+%Y-%m-%d %H:%M:%S')]${tag} $*"
+    echo "$msg"
+    echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# System-wide free memory percentage (0-100). The trigger signal. Defaults to
+# 100 (assume healthy) if unreadable — fail safe, never reclaim on a parse error.
+free_pct() {
+    local v
+    v=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/{gsub(/%/,"",$2); print $2; exit}')
+    [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 100
+}
+
+# kern pressure level — logged for context only, NOT used as a trigger (pinned at 2 here).
+kern_level() {
+    local v; v=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+    [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo "?"
+}
+
+# Echo the claude PID running inside a tmux session's pane, or nothing.
+claude_pid_for() {
+    local sess="$1"
+    [[ -z "$sess" ]] && return 0
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "=$sess" -F '#{pane_pid}' 2>/dev/null | head -1)
+    [[ -z "$pane_pid" ]] && return 0
+    # claude runs as a child of the pane shell
+    pgrep -P "$pane_pid" -f '(^|/)claude( |$)' 2>/dev/null | head -1
+}
+
+# True if the pane is visibly changing (spinner / streaming tokens / tool output)
+# over a short window — i.e. claude is actively working right now. Cheap final
+# guard against reclaiming a detached session mid-work when session_activity is
+# briefly stale (e.g. a silent long tool call that just started redrawing).
+pane_changing() {
+    local sess="$1" a b
+    a=$(tmux capture-pane -t "=$sess" -p 2>/dev/null | md5)
+    sleep 2
+    b=$(tmux capture-pane -t "=$sess" -p 2>/dev/null | md5)
+    [[ "$a" != "$b" ]]
+}
+
+# Reclaim one session. Guards empty target and missing claude. Honors --dry-run.
+reclaim() {
+    local sess="$1" reason="$2"
+    [[ -z "$sess" ]] && return 0                       # empty-target guard (never kill "current")
+    local cpid
+    cpid=$(claude_pid_for "$sess")
+    if [[ -z "$cpid" ]]; then
+        return 1                                        # no claude running here → nothing to reclaim
+    fi
+    if pane_changing "$sess"; then
+        log "skip $sess — pane actively changing (claude working), not idle"
+        return 1
+    fi
+    local rss_mb
+    rss_mb=$(ps -o rss= -p "$cpid" 2>/dev/null | awk '{printf "%.0f", $1/1024}')
+    if $DRY_RUN; then
+        log "WOULD quit $sess (pid $cpid, ~${rss_mb}MB) — $reason"
+        return 0
+    fi
+    log "quitting $sess (pid $cpid, ~${rss_mb}MB) — $reason"
+    kill -TERM "$cpid" 2>/dev/null
+    return 0
+}
+
+# Emit "idle_secs<TAB>session" for cc-* sessions that are detached and idle
+# beyond $1 seconds, sorted oldest-idle first. Blank/zero activity → skipped
+# (cannot determine idleness → never reclaim on a guess).
+candidates() {
+    local min_idle="$1" now
+    now=$(date +%s)
+    tmux list-sessions -F '#{session_name}	#{session_attached}	#{session_activity}' 2>/dev/null \
+    | while IFS=$'\t' read -r name attached activity; do
+        [[ -z "$name" ]] && continue
+        [[ "$name" == cc-* ]] || continue
+        [[ "$name" =~ $EXCLUDE_RE ]] && continue
+        [[ "$attached" == "0" ]] || continue           # someone is looking → skip
+        [[ "$activity" =~ ^[0-9]+$ ]] || continue
+        (( activity > 0 )) || continue
+        local idle=$(( now - activity ))
+        (( idle > min_idle )) || continue
+        printf '%s\t%s\n' "$idle" "$name"
+    done | sort -rn
+}
+
+pass() {
+    # Opt-in gate (re-checked every pass, not just at startup): does nothing
+    # at all unless settings.conf currently says IDLE_WATCHDOG=on. Logs only
+    # on a state TRANSITION (first check, or flipping since the previous
+    # pass) so a long-running disabled daemon doesn't spam one line per
+    # POLL_INTERVAL forever.
+    if ! idle_watchdog_enabled; then
+        if [[ "${_CIW_LAST_ENABLED:-}" != "0" ]]; then
+            log "IDLE_WATCHDOG is off (settings.conf) — skipping this and all following passes until enabled"
+        fi
+        _CIW_LAST_ENABLED=0
+        return 0
+    fi
+    if [[ "${_CIW_LAST_ENABLED:-}" == "0" ]]; then
+        log "IDLE_WATCHDOG turned on — resuming reclaim passes"
+    fi
+    _CIW_LAST_ENABLED=1
+
+    # Policy 1 — baseline reaper (always, independent of pressure)
+    while IFS=$'\t' read -r idle name; do
+        [[ -z "$name" ]] && continue
+        reclaim "$name" "idle $((idle/3600))h > 2d, detached"
+    done < <(candidates "$IDLE_2D_SECS")
+
+    # Policy 2 — pressure valve (only when free% is SUSTAINED below floor across two passes)
+    local free klvl; free=$(free_pct); klvl=$(kern_level)
+    if (( free < FREE_FLOOR_PCT )) && (( PREV_LOW == 1 )); then
+        log "sustained low memory (free ${free}% < ${FREE_FLOOR_PCT}%, kern_level $klvl) — engaging valve"
+        local quits=0
+        while IFS=$'\t' read -r idle name; do
+            [[ -z "$name" ]] && continue
+            (( quits >= MAX_QUITS_PER_RUN )) && { log "hit MAX_QUITS_PER_RUN=$MAX_QUITS_PER_RUN — stopping"; break; }
+            (( $(free_pct) < FREE_FLOOR_PCT )) || { log "memory recovered (free $(free_pct)%) — stopping valve"; break; }
+            if reclaim "$name" "pressure valve (free ${free}%), idle $((idle/60))m"; then
+                quits=$(( quits + 1 ))
+                $DRY_RUN || sleep "$SETTLE_SECS"        # let RAM settle before re-reading
+            fi
+        done < <(candidates "$IDLE_PRESSURE_SECS")
+        (( quits == 0 )) && log "valve engaged but no eligible idle+detached candidates"
+    fi
+    PREV_LOW=$(( free < FREE_FLOOR_PCT ? 1 : 0 ))
+}
+
+PREV_LOW=0
+_mode=""; $DRY_RUN && _mode="${_mode}, DRY-RUN"; $ONCE && _mode="${_mode}, ONCE"
+_enabled_str="off (no reclaim until IDLE_WATCHDOG=on in settings.conf)"
+idle_watchdog_enabled && _enabled_str="on"
+log "watchdog start — IDLE_WATCHDOG=${_enabled_str} — 2d-reaper + pressure-valve(free<${FREE_FLOOR_PCT}%, sustained), poll ${POLL_INTERVAL}s${_mode}"
+
+if $ONCE; then
+    # Two passes so the sustained-pressure gate can actually fire in a single invocation.
+    pass
+    (( POLL_INTERVAL > 0 )) && sleep 2
+    pass
+    exit 0
+fi
+
+while true; do
+    pass
+    sleep "$POLL_INTERVAL"
+done

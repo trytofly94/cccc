@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.user.claude-cleanup.plist — launchd template for the vendored
+  scripts/claude-cleanup orphan-reaper daemon (Phase 10, CLEANUP-01/02).
+
+  Label is deliberately DISTINCT from the maintainer's pre-existing
+  `com.user.claude-orphan-cleanup` production daemon (see
+  ~/Library/LaunchAgents/com.user.claude-orphan-cleanup.plist) so this
+  template never silently collides with or overwrites it. install.sh
+  substitutes the __CLAUDE_CLEANUP_BIN__ placeholder below with the real
+  $HOME/.local/bin/claude-cleanup path at generation time — do NOT hardcode
+  an absolute /Users/<name> path in this repo-shipped template.
+
+  Schedule mirrors com.user.claude-orphan-cleanup's existing cadence
+  (04:00 + 12:00, verified live in 10-RESEARCH.md "State of the Art").
+
+  Scheduling-contention caution: the now-retired scripts/com.user.watcher-
+  cleanup.plist deliberately ran its sweep at a 30-minute offset (04:30 +
+  12:30) from this schedule, to avoid two daemons contending at the exact
+  same minute. If a future second daemon is ever added here, prefer a
+  similar off-the-hour offset rather than reusing :00/:30 exactly.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.claude-cleanup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CLAUDE_CLEANUP_BIN__</string>
+        <string>--quiet</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>4</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>12</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__CLAUDE_CLEANUP_LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__CLAUDE_CLEANUP_LOG__</string>
+</dict>
+</plist>

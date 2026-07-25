@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# claude-cleanup - Enhanced orphan process cleanup with process tree detection
+#
+# Finds orphaned Claude processes (PPID=1, daemon TTY: "??" on macOS / "?" on
+# Linux) and their entire process trees (node, bun, python children). Also
+# catches orphaned children whose Claude parent already died — but only those
+# whose argv actually references Claude (~/.claude/, @anthropic, anthropic-ai,
+# or a `claude` wrapper). A bare unrelated node/python daemon is never killed.
+#
+# Usage:
+#   claude-cleanup              # Normal cleanup
+#   claude-cleanup --dry-run    # Show what would be killed
+#   claude-cleanup --force      # Skip 24h age check
+#   claude-cleanup --verbose    # Detailed output
+#   claude-cleanup --quiet      # No output (for cc integration)
+
+set -euo pipefail
+
+# --- Configuration ---
+LOG_DIR="$HOME/.local/log/claude-cleanup"
+LOG_FILE="$LOG_DIR/claude-cleanup.log"   # legacy / per-run (overwritten each time)
+MAX_LOG_RUNS=20                          # keep last N run logs
+MIN_AGE_SECONDS=$((24 * 60 * 60))  # 24 hours
+SIGTERM_WAIT=5                       # seconds to wait before SIGKILL
+ALLOWED_COMMS="claude|node|bun|python|python3"
+MAX_WORKER_POOL=30                   # max allowed worker-service children
+
+# --- Parse arguments ---
+DRY_RUN=false
+FORCE=false
+VERBOSE=false
+QUIET=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run|-n) DRY_RUN=true ;;
+        --force)      FORCE=true ;;
+        --verbose|-v) VERBOSE=true ;;
+        --quiet|-q)   QUIET=true ;;
+        --help|-h)
+            echo "Usage: claude-cleanup [--dry-run|-n] [--force] [--verbose|-v] [--quiet|-q]"
+            echo ""
+            echo "  --dry-run, -n   Show what would be killed without killing"
+            echo "  --force         Skip 24h minimum age check"
+            echo "  --verbose, -v   Detailed output"
+            echo "  --quiet, -q     No output (for automated use)"
+            echo ""
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# --- Color output (only in interactive terminal) ---
+if [[ -t 1 ]] && [[ "$QUIET" == false ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    GRAY='\033[0;90m'
+    BOLD='\033[1m'
+    NC='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' GRAY='' BOLD='' NC=''
+fi
+
+# --- Logging ---
+mkdir -p "$LOG_DIR"
+
+# Per-run log file: YYYY-MM-DD_HH-MM-SS.log
+RUN_TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+RUN_LOG="$LOG_DIR/$RUN_TIMESTAMP.log"
+
+log() {
+    local level="$1"; shift
+    local msg="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local line="$timestamp [$level] $msg"
+    echo "$line" >> "$RUN_LOG"
+    echo "$line" >> "$LOG_FILE"
+}
+
+rotate_logs() {
+    # Keep only the last MAX_LOG_RUNS dated log files (YYYY-MM-DD_*.log)
+    local count
+    count=$(ls -1 "$LOG_DIR"/????-??-??_*.log 2>/dev/null | wc -l | tr -d ' ')
+    if (( count > MAX_LOG_RUNS )); then
+        ls -1t "$LOG_DIR"/????-??-??_*.log 2>/dev/null \
+            | tail -n "+$(( MAX_LOG_RUNS + 1 ))" \
+            | xargs rm -f
+    fi
+}
+
+output() {
+    [[ "$QUIET" == true ]] && return
+    echo -e "$@"
+}
+
+verbose() {
+    [[ "$VERBOSE" == false ]] && return
+    output "${GRAY}  $*${NC}"
+}
+
+# --- Service detection ---
+# Returns 0 (true) if the process is a known service that should be preserved
+is_known_service() {
+    local pid="$1"
+    local args
+    args=$(ps -p "$pid" -o args= 2>/dev/null) || return 1
+
+    # worker-service.cjs (claude-mem pool manager)
+    [[ "$args" == *"worker-service.cjs"* ]] && return 0
+    # HAPI runner
+    [[ "$args" == *"runner"*"start-sync"* ]] && return 0
+    # HAPI server
+    [[ "$args" == *"index.ts"*"server"* ]] && return 0
+    # n8n server
+    [[ "$args" == *"n8n"* ]] && return 0
+    # chroma-mcp (Python embeddings server)
+    [[ "$args" == *"chroma"* ]] && return 0
+    # claude-mem daemon
+    [[ "$args" == *"claude-mem"*"daemon"* ]] && return 0
+    # MCP servers (various)
+    [[ "$args" == *"mcp-server"* ]] && return 0
+    [[ "$args" == *"mcp_server"* ]] && return 0
+
+    return 1
+}
+
+# --- Claude provenance check ---
+# Returns 0 (true) ONLY if the process's argv actually references Claude —
+# proving it was spawned by/for a Claude Code session. A bare node/python
+# daemon (pm2, jupyter, a home-grown server, someone else's MCP gateway) has
+# no such marker and MUST NOT be killed. "No claude in the same PGID" proves
+# absence, not Claude provenance, so it is NOT sufficient on its own — this
+# gate is the real safety net on strangers' machines.
+has_claude_provenance() {
+    local pid="$1"
+    local args
+    args=$(ps -p "$pid" -o args= 2>/dev/null) || return 1
+
+    # A Claude Code process (or its leaked node/python child) references the
+    # ~/.claude/ tree, the @anthropic-ai npm package, an anthropic-ai/... path,
+    # or a `claude` CLI wrapper somewhere in its argv.
+    [[ "$args" == *"/.claude/"* ]]      && return 0
+    [[ "$args" == *"@anthropic"* ]]     && return 0
+    [[ "$args" == *"anthropic-ai"* ]]   && return 0
+    [[ "$args" == *"anthropic"* ]]      && return 0
+    # `claude` wrapper path — e.g. .../bin/claude or .../claude-code/...
+    [[ "$args" == *"/claude"* ]]        && return 0
+    [[ "$args" == *" claude"* ]]        && return 0
+
+    return 1
+}
+
+# --- Process age check ---
+# Returns 0 if process is older than MIN_AGE_SECONDS
+is_old_enough() {
+    local pid="$1"
+    local start_time
+    # lstart gives human-readable start time
+    start_time=$(ps -p "$pid" -o lstart= 2>/dev/null) || return 1
+    # WR-02: macOS `date -j` first, then GNU/Linux `date -d` fallback — this
+    # mirrors cc/limit-watcher.sh's parse_reset_epoch() two-tier pattern so
+    # the 24h age gate doesn't silently classify every process as "too young"
+    # forever on Linux (where `date -j` is not a valid flag and always fails).
+    local start_epoch
+    start_epoch=$(date -j -f "%a %b %d %T %Y" "$start_time" "+%s" 2>/dev/null) \
+        || start_epoch=$(date -d "$start_time" "+%s" 2>/dev/null) \
+        || return 1
+    local now_epoch
+    now_epoch=$(date "+%s")
+    local age=$(( now_epoch - start_epoch ))
+
+    if [[ "$FORCE" == true ]] || (( age >= MIN_AGE_SECONDS )); then
+        return 0
+    fi
+    return 1
+}
+
+# --- Get all descendants of a PID (recursive) ---
+get_descendants() {
+    local parent_pid="$1"
+    local children
+    children=$(ps -eo pid,ppid 2>/dev/null | awk -v ppid="$parent_pid" '$2 == ppid {print $1}')
+    for child in $children; do
+        echo "$child"
+        get_descendants "$child"
+    done
+}
+
+# --- Main cleanup logic ---
+main() {
+    local kill_pids=()
+    local skip_count=0
+    local service_skip_count=0
+
+    output "${BOLD}Claude Process Tree Cleanup${NC}"
+    [[ "$DRY_RUN" == true ]] && output "${YELLOW}  (dry-run mode - nothing will be killed)${NC}"
+    [[ "$FORCE" == true ]] && output "${YELLOW}  (force mode - no age minimum)${NC}"
+    output ""
+
+    # --- Phase 1: Find orphaned Claude parent processes ---
+    verbose "Phase 1: Finding orphaned Claude processes (PPID=1, TTY=??)..."
+
+    local orphan_claudes=()
+    while IFS= read -r line; do
+        local pid ppid tty comm
+        pid=$(echo "$line" | awk '{print $1}')
+        ppid=$(echo "$line" | awk '{print $2}')
+        tty=$(echo "$line" | awk '{print $3}')
+        comm=$(echo "$line" | awk '{print $4}')
+
+        # Must be: PPID=1, TTY=??/? (macOS prints "??", Linux procps prints
+        # "?" for daemons — accept both or this is a silent no-op on Linux),
+        # comm=claude
+        [[ "$ppid" != "1" ]] && continue
+        [[ "$tty" != "??" && "$tty" != "?" ]] && continue
+        [[ "$comm" != "claude" ]] && continue
+
+        # Check if it's a known service
+        if is_known_service "$pid"; then
+            verbose "Skipping service (PID $pid): $(ps -p "$pid" -o args= 2>/dev/null | head -c 80)"
+            ((service_skip_count++)) || true
+            continue
+        fi
+
+        # Check age
+        if ! is_old_enough "$pid"; then
+            verbose "Skipping young process (PID $pid)"
+            ((skip_count++)) || true
+            continue
+        fi
+
+        orphan_claudes+=("$pid")
+        verbose "Found orphaned Claude: PID $pid"
+    done < <(ps -eo pid,ppid,tty,comm 2>/dev/null)
+
+    # --- Phase 2: Collect process trees of orphaned Claudes ---
+    verbose ""
+    verbose "Phase 2: Collecting process trees..."
+
+    for claude_pid in "${orphan_claudes[@]+"${orphan_claudes[@]}"}"; do
+        kill_pids+=("$claude_pid")
+        local descendants
+        descendants=$(get_descendants "$claude_pid")
+        for desc in $descendants; do
+            local desc_comm
+            desc_comm=$(ps -p "$desc" -o comm= 2>/dev/null) || continue
+            # Only kill allowed process types
+            if echo "$desc_comm" | grep -qE "^($ALLOWED_COMMS)$"; then
+                if ! is_known_service "$desc"; then
+                    kill_pids+=("$desc")
+                    verbose "  Tree child: PID $desc ($desc_comm) under Claude $claude_pid"
+                fi
+            fi
+        done
+    done
+
+    # --- Phase 2b: Cap worker-service pool size ---
+    verbose ""
+    verbose "Phase 2b: Checking worker-service pool size (max $MAX_WORKER_POOL)..."
+
+    local worker_service_pid
+    worker_service_pid=$(pgrep -f "worker-service.cjs" 2>/dev/null | head -1 || true)
+
+    if [[ -n "$worker_service_pid" ]]; then
+        # Get all children of worker-service, sorted by start time (oldest first).
+        # CR-02: use `etimes` (elapsed seconds, numeric) rather than `lstart`
+        # (weekday/month text) — a plain `sort` on lstart fields sorts
+        # alphabetically ("Jan" < "Feb" regardless of year, "Mon" < "Tue"
+        # regardless of week), which does not correspond to chronological
+        # order and could select non-idle processes to kill. Sorting `etimes`
+        # numerically descending puts the truly oldest (largest elapsed
+        # seconds) processes first, matching the "oldest excess workers" intent.
+        local worker_pids=()
+        while IFS= read -r wpid; do
+            worker_pids+=("$wpid")
+        done < <(ps -eo pid,ppid,etimes 2>/dev/null \
+            | awk -v ppid="$worker_service_pid" '$2 == ppid {print $1, $3}' \
+            | sort -k2,2 -nr \
+            | awk '{print $1}')
+
+        local pool_size=${#worker_pids[@]}
+        verbose "  Worker pool size: $pool_size (limit: $MAX_WORKER_POOL)"
+
+        if (( pool_size > MAX_WORKER_POOL )); then
+            local excess=$(( pool_size - MAX_WORKER_POOL ))
+            output "${YELLOW}Worker pool has $pool_size processes (limit: $MAX_WORKER_POOL) — trimming $excess oldest${NC}"
+            # Kill the oldest excess workers (first in the sorted list)
+            for (( i=0; i<excess; i++ )); do
+                local wpid="${worker_pids[$i]}"
+                kill_pids+=("$wpid")
+                verbose "  Excess worker: PID $wpid"
+            done
+            log "INFO" "Worker pool trim: $pool_size → $MAX_WORKER_POOL (killing $excess oldest)"
+        fi
+    else
+        verbose "  worker-service not running, skipping pool check"
+    fi
+
+    # --- Phase 3: Find orphaned children whose Claude parent already died ---
+    verbose ""
+    verbose "Phase 3: Finding orphaned node/bun/python (parent already dead)..."
+
+    while IFS= read -r line; do
+        local pid ppid tty comm
+        pid=$(echo "$line" | awk '{print $1}')
+        ppid=$(echo "$line" | awk '{print $2}')
+        tty=$(echo "$line" | awk '{print $3}')
+        comm=$(echo "$line" | awk '{print $4}')
+
+        # Must be: PPID=1, TTY=??/? (macOS "??" / Linux "?"), comm in allowed
+        # list (but not claude, handled above)
+        [[ "$ppid" != "1" ]] && continue
+        [[ "$tty" != "??" && "$tty" != "?" ]] && continue
+        [[ "$comm" == "claude" ]] && continue
+        echo "$comm" | grep -qE "^($ALLOWED_COMMS)$" || continue
+
+        # Skip if already in kill list
+        local already_listed=false
+        for existing in "${kill_pids[@]+"${kill_pids[@]}"}"; do
+            [[ "$existing" == "$pid" ]] && already_listed=true && break
+        done
+        [[ "$already_listed" == true ]] && continue
+
+        # Check if it's a known service
+        if is_known_service "$pid"; then
+            verbose "Skipping service (PID $pid): $(ps -p "$pid" -o args= 2>/dev/null | head -c 80)"
+            ((service_skip_count++)) || true
+            continue
+        fi
+
+        # Check age
+        if ! is_old_enough "$pid"; then
+            verbose "Skipping young process (PID $pid, $comm)"
+            ((skip_count++)) || true
+            continue
+        fi
+
+        # Provenance gate (CRITICAL): only reap a process whose argv actually
+        # proves Claude origin. A bare node/python/bun daemon on a stranger's
+        # machine (pm2, jupyter, a home-grown server, an unrelated MCP gateway)
+        # matches every criterion above yet is NOT ours — killing it is data
+        # loss. "No claude in the same PGID" proves absence, not provenance, so
+        # it is NOT sufficient. Require a real Claude marker in the argv; if it
+        # shows none, SKIP unconditionally.
+        if ! has_claude_provenance "$pid"; then
+            verbose "Skipping non-Claude daemon (PID $pid, $comm): $(ps -p "$pid" -o args= 2>/dev/null | head -c 80)"
+            ((skip_count++)) || true
+            continue
+        fi
+
+        # Belongs to a dead Claude session only if no living claude shares its
+        # PGID — otherwise the parent claude is alive and this child is in use.
+        local pgid
+        pgid=$(ps -p "$pid" -o pgid= 2>/dev/null | tr -d ' ') || continue
+        local pgid_has_claude
+        pgid_has_claude=$(ps -eo pid,pgid,comm 2>/dev/null | awk -v pg="$pgid" '$2 == pg && $3 == "claude" {print $1}')
+        if [[ -z "$pgid_has_claude" ]]; then
+            kill_pids+=("$pid")
+            verbose "  Orphaned Claude child: PID $pid ($comm), PGID $pgid (Claude provenance, no live claude in group)"
+        fi
+    done < <(ps -eo pid,ppid,tty,comm 2>/dev/null)
+
+    # --- Phase 4: Kill ---
+    output ""
+    local total=${#kill_pids[@]}
+
+    if (( total == 0 )); then
+        output "${GREEN}No orphaned processes found.${NC}"
+        [[ $skip_count -gt 0 ]] && output "${GRAY}  ($skip_count young processes skipped, $service_skip_count services preserved)${NC}"
+        log "INFO" "Cleanup run: 0 orphans found ($skip_count young, $service_skip_count services)"
+        return 0
+    fi
+
+    output "${BOLD}Found $total orphaned process(es) to clean up:${NC}"
+    for pid in "${kill_pids[@]+"${kill_pids[@]}"}"; do
+        local info
+        info=$(ps -p "$pid" -o pid=,comm=,args= 2>/dev/null | head -c 120) || info="PID $pid (already gone)"
+        output "  ${RED}kill${NC} $info"
+    done
+
+    if [[ "$DRY_RUN" == true ]]; then
+        output ""
+        output "${YELLOW}Dry run - no processes were killed.${NC}"
+        log "INFO" "Dry run: would kill $total processes: ${kill_pids[*]}"
+        return 0
+    fi
+
+    # SIGTERM first (graceful)
+    output ""
+    output "Sending SIGTERM..."
+    for pid in "${kill_pids[@]+"${kill_pids[@]}"}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    # Wait and check survivors
+    sleep "$SIGTERM_WAIT"
+
+    local survivors=()
+    for pid in "${kill_pids[@]+"${kill_pids[@]}"}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            survivors+=("$pid")
+        fi
+    done
+
+    if (( ${#survivors[@]} > 0 )); then
+        output "Sending SIGKILL to ${#survivors[@]} survivor(s)..."
+        for pid in "${survivors[@]+"${survivors[@]}"}"; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
+
+    # WR-01: verify SIGKILL actually succeeded instead of assuming it did —
+    # the old `total - survivors + survivors` expression was a mathematical
+    # no-op that always reported $total regardless of real kill outcome.
+    local still_alive=0
+    for pid in "${survivors[@]+"${survivors[@]}"}"; do
+        kill -0 "$pid" 2>/dev/null && still_alive=$(( still_alive + 1 )) || true
+    done
+    local killed=$(( total - still_alive ))
+    output ""
+    output "${GREEN}Cleaned up $killed process(es).${NC}"
+    [[ $still_alive -gt 0 ]] && output "${YELLOW}  ($still_alive process(es) survived SIGKILL — check permissions)${NC}"
+    [[ $skip_count -gt 0 ]] && output "${GRAY}  ($skip_count young processes skipped, $service_skip_count services preserved)${NC}"
+
+    log "INFO" "Cleaned $killed orphaned processes: ${kill_pids[*]}"
+}
+
+main
+rotate_logs

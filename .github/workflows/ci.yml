@@ -1,0 +1,86 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure shellcheck is installed (first-party, command -v-guarded)
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            command -v shellcheck >/dev/null || brew install shellcheck
+          fi
+          # ubuntu-latest already ships shellcheck; no-op guard for parity.
+          command -v shellcheck >/dev/null || { echo "ERROR: shellcheck still unavailable after install attempt" >&2; exit 1; }
+          shellcheck --version
+
+      - name: Run shellcheck (-S warning, existence-guarded targets)
+        run: |
+          rc=0
+          for f in cccc/cccc cccc/limit-watcher.sh scripts/claude-cleanup install.sh scripts/*.sh; do
+            if [ -f "$f" ]; then
+              echo "Linting: $f"
+              shellcheck -S warning "$f" || rc=1
+            else
+              echo "SKIP: $f not present (private-only or export-specific)"
+            fi
+          done
+          exit "$rc"
+
+      - name: Syntax-check cc-webui.py (existence-guarded — not a shell target)
+        run: |
+          if [ -f cccc/cc-webui.py ]; then
+            python3 -m py_compile cccc/cc-webui.py
+          else
+            echo "SKIP: cccc/cc-webui.py not present"
+          fi
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure tmux is installed (first-party, command -v-guarded)
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            command -v tmux >/dev/null || brew install tmux
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            command -v tmux >/dev/null || (sudo apt-get update -y && sudo apt-get install -y tmux)
+          fi
+          command -v tmux >/dev/null || { echo "ERROR: tmux still unavailable after install attempt" >&2; exit 1; }
+          tmux -V
+
+      - name: Sanity-check jq is present
+        run: |
+          command -v jq >/dev/null || { echo "ERROR: jq not found on runner (expected pre-installed on both macos-latest and ubuntu-latest)" >&2; exit 1; }
+
+      - name: Run shell test suite (env -u TMUX defensive sandbox)
+        run: |
+          shopt -s nullglob
+          files=(cccc/test-*.sh)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No cccc/test-*.sh files found — skipping (public export tree may ship fewer tests)."
+            exit 0
+          fi
+          rc=0
+          for f in "${files[@]}"; do
+            echo "Running: $f"
+            env -u TMUX bash "$f" || rc=1
+          done
+          exit "$rc"
